@@ -225,7 +225,125 @@ impl Payloader for H264Payloader {
 pub struct H264Packet {
     /// Whether to emit AVCC length-prefixed output instead of Annex B start codes.
     pub is_avc: bool,
-    fua_buffer: Option<BytesMut>,
+    /// Accumulates FU-A fragments across calls. Kept as a persistent buffer (cleared, not
+    /// dropped, between NAL units) so a fragmented keyframe doesn't force repeated
+    /// grow-and-copy reallocations on every access unit — see `reset()`.
+    fua_buffer: BytesMut,
+    /// Whether `fua_buffer` currently holds an in-progress (not yet FU-end) fragment.
+    fua_in_progress: bool,
+}
+
+impl H264Packet {
+    /// Clears per-access-unit state (the FU-A reassembly buffer) while preserving its
+    /// allocated capacity, so the next fragmented NAL unit doesn't need to reallocate.
+    ///
+    /// Callers that used to replace the whole `H264Packet` with `H264Packet::default()`
+    /// between access units should call this instead to keep the capacity warm.
+    pub fn reset(&mut self) {
+        self.fua_buffer.clear();
+        self.fua_in_progress = false;
+    }
+
+    /// Parses a NAL packet and writes Annex B / AVCC data directly into a pre-allocated slice `out`.
+    ///
+    /// Returns `Ok(Some(bytes_written))` when a full NAL unit is assembled, or `Ok(None)` if more FU-A fragments are needed.
+    /// This avoids heap allocations and intermediate copies, which is critical for low-overhead hardware decoders (such as PS Vita's SceAvcdec).
+    pub fn depacketize_direct(&mut self, packet: &[u8], out: &mut [u8]) -> Result<Option<usize>> {
+        if packet.len() <= 1 {
+            return Err(Error::ErrShortPacket);
+        }
+
+        let b0 = packet[0];
+        let nalu_type = b0 & NALU_TYPE_BITMASK;
+
+        if packet.len() <= 2 && nalu_type != AUD_NALU_TYPE {
+            return Err(Error::ErrShortPacket);
+        }
+
+        match nalu_type {
+            1..=23 => {
+                let needed = 4 + packet.len();
+                if out.len() < needed {
+                    return Err(Error::ErrBufferShort);
+                }
+                if self.is_avc {
+                    let len_bytes = (packet.len() as u32).to_be_bytes();
+                    out[..4].copy_from_slice(&len_bytes);
+                } else {
+                    out[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                }
+                out[4..needed].copy_from_slice(packet);
+                Ok(Some(needed))
+            }
+            STAPA_NALU_TYPE => {
+                let mut curr_offset = STAPA_HEADER_SIZE;
+                let mut out_offset = 0;
+                while curr_offset < packet.len() {
+                    let nalu_size =
+                        ((packet[curr_offset] as usize) << 8) | packet[curr_offset + 1] as usize;
+                    curr_offset += STAPA_NALU_LENGTH_SIZE;
+
+                    if packet.len() < curr_offset + nalu_size {
+                        return Err(Error::StapASizeLargerThanBuffer(
+                            nalu_size,
+                            packet.len() - curr_offset,
+                        ));
+                    }
+
+                    let needed = out_offset + 4 + nalu_size;
+                    if out.len() < needed {
+                        return Err(Error::ErrBufferShort);
+                    }
+
+                    if self.is_avc {
+                        let len_bytes = (nalu_size as u32).to_be_bytes();
+                        out[out_offset..out_offset + 4].copy_from_slice(&len_bytes);
+                    } else {
+                        out[out_offset..out_offset + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    }
+                    out[out_offset + 4..needed].copy_from_slice(&packet[curr_offset..curr_offset + nalu_size]);
+                    out_offset = needed;
+                    curr_offset += nalu_size;
+                }
+                Ok(Some(out_offset))
+            }
+            FUA_NALU_TYPE => {
+                if packet.len() < FUA_HEADER_SIZE {
+                    return Err(Error::ErrShortPacket);
+                }
+
+                if !self.fua_in_progress {
+                    self.fua_buffer.clear();
+                    self.fua_in_progress = true;
+                }
+                self.fua_buffer.extend_from_slice(&packet[FUA_HEADER_SIZE..]);
+
+                let b1 = packet[1];
+                if b1 & FU_END_BITMASK != 0 {
+                    let nalu_ref_idc = b0 & NALU_REF_IDC_BITMASK;
+                    let fragmented_nalu_type = b1 & NALU_TYPE_BITMASK;
+
+                    self.fua_in_progress = false;
+                    let needed = 4 + 1 + self.fua_buffer.len();
+                    if out.len() < needed {
+                        return Err(Error::ErrBufferShort);
+                    }
+                    if self.is_avc {
+                        let len_bytes = ((self.fua_buffer.len() + 1) as u32).to_be_bytes();
+                        out[..4].copy_from_slice(&len_bytes);
+                    } else {
+                        out[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                    }
+                    out[4] = nalu_ref_idc | fragmented_nalu_type;
+                    out[5..needed].copy_from_slice(&self.fua_buffer);
+                    Ok(Some(needed))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(Error::NaluTypeIsNotHandled(nalu_type)),
+        }
+    }
 }
 
 impl Depacketizer for H264Packet {
@@ -287,28 +405,25 @@ impl Depacketizer for H264Packet {
                     return Err(Error::ErrShortPacket);
                 }
 
-                if self.fua_buffer.is_none() {
-                    self.fua_buffer = Some(BytesMut::new());
+                if !self.fua_in_progress {
+                    self.fua_buffer.clear();
+                    self.fua_in_progress = true;
                 }
-
-                if let Some(fua_buffer) = &mut self.fua_buffer {
-                    fua_buffer.put(&*packet.slice(FUA_HEADER_SIZE..));
-                }
+                self.fua_buffer.put(&*packet.slice(FUA_HEADER_SIZE..));
 
                 let b1 = packet[1];
                 if b1 & FU_END_BITMASK != 0 {
                     let nalu_ref_idc = b0 & NALU_REF_IDC_BITMASK;
                     let fragmented_nalu_type = b1 & NALU_TYPE_BITMASK;
 
-                    if let Some(fua_buffer) = self.fua_buffer.take() {
-                        if self.is_avc {
-                            payload.put_u32((fua_buffer.len() + 1) as u32);
-                        } else {
-                            payload.put(&*ANNEXB_NALUSTART_CODE);
-                        }
-                        payload.put_u8(nalu_ref_idc | fragmented_nalu_type);
-                        payload.put(fua_buffer);
+                    self.fua_in_progress = false;
+                    if self.is_avc {
+                        payload.put_u32((self.fua_buffer.len() + 1) as u32);
+                    } else {
+                        payload.put(&*ANNEXB_NALUSTART_CODE);
                     }
+                    payload.put_u8(nalu_ref_idc | fragmented_nalu_type);
+                    payload.put(self.fua_buffer.split());
 
                     Ok(payload.freeze())
                 } else {

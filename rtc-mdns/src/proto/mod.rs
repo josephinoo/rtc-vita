@@ -666,7 +666,7 @@ impl Mdns {
             let local_ip = if let Some(body) = answer_resource.body
                 && let Some(a) = body.as_any().downcast_ref::<AResource>()
             {
-                let local_ip = Ipv4Addr::from_octets(a.a).into();
+                let local_ip = Ipv4Addr::from(a.a).into();
                 if local_ip != src.ip() {
                     warn!(
                         "mDNS answers with different local ip on AResource {} vs src ip {} on Socket for query {}",
