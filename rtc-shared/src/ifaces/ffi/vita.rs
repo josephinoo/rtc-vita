@@ -18,7 +18,7 @@ pub union SceNetCtlInfo {
 }
 
 #[link(name = "SceNetCtl_stub")]
-extern "C" {
+unsafe extern "C" {
     fn sceNetCtlInetGetInfo(code: c_int, info: *mut SceNetCtlInfo) -> c_int;
 }
 
